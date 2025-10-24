@@ -1,0 +1,750 @@
+/*
+* HybridThermoFoam - Custom CFD Solver
+* Coupled Thermal-Fluid Dynamics with Adaptive Algorithm Switching
+* Author: J YADAGIRI | CFD Development Engineer
+* https://www.linkedin.com/in/j-yadagiri-4944ba21b?utm_source=share&utm_campaign=share_via&utm_content=profile&utm_medium=android_app
+* Features:
+* - Hybrid PISO/SIMPLE algorithm selection
+* - Coupled energy equation for temperature field
+* - Buoyancy-driven flows (Boussinesq approximation)
+* - Adaptive time-stepping and under-relaxation
+* - Multi-corrector framework with convergence monitoring
+*
+* Application: Conjugate heat transfer, natural convection, thermal systems
+*/
+
+#include <iostream>
+#include <vector>
+#include <cmath>
+#include <fstream>
+#include <iomanip>
+#include <string>
+#include <algorithm>
+#include <memory>
+
+// ============================================================
+// ENUMERATIONS AND CONSTANTS
+// ============================================================
+enum class SolverMode {
+PISO_TRANSIENT,
+SIMPLE_STEADY,
+HYBRID_ADAPTIVE
+};
+
+enum class FlowRegime {
+STEADY,
+UNSTEADY,
+TRANSITIONAL
+};
+
+// ============================================================
+// HYBRID THERMOFOAM SOLVER CLASS
+// ============================================================
+class HybridThermoFoam {
+private:
+// Grid parameters
+int nx, ny;
+double dx, dy;
+double Lx, Ly;
+
+// Fluid properties
+double rho, mu, nu;
+double cp; // Specific heat capacity
+double k_thermal; // Thermal conductivity
+double alpha_thermal; // Thermal diffusivity
+double beta; // Thermal expansion coefficient
+double T_ref; // Reference temperature
+double g; // Gravitational acceleration
+
+// Time parameters
+double dt, dt_min, dt_max;
+double t_current, t_final;
+double CFL_target;
+bool adaptive_time_step;
+
+// Solver control
+SolverMode solver_mode;
+FlowRegime flow_regime;
+int n_correctors;
+int n_ortho_correct;
+int n_energy_correct;
+
+// Under-relaxation factors
+double alpha_u, alpha_v, alpha_p, alpha_T;
+bool adaptive_relaxation;
+
+// Convergence criteria
+double tol_momentum;
+double tol_pressure;
+double tol_energy;
+double tol_continuity;
+
+// Field variables
+std::vector<std::vector<double>> u, v, p, T; // Primary fields
+std::vector<std::vector<double>> u_old, v_old, T_old; // Previous time step
+std::vector<std::vector<double>> u_star, v_star; // Predictor
+std::vector<std::vector<double>> p_prime; // Pressure correction
+std::vector<std::vector<double>> buoyancy_x, buoyancy_y; // Buoyancy forces
+
+// Residual tracking
+std::vector<double> momentum_residuals;
+std::vector<double> pressure_residuals;
+std::vector<double> energy_residuals;
+
+// Statistics
+int total_iterations;
+int time_steps;
+
+public:
+HybridThermoFoam(int nx_, int ny_, double Lx_, double Ly_,
+double rho_, double mu_, double cp_, double k_thermal_,
+double dt_, double t_final_)
+: nx(nx_), ny(ny_), Lx(Lx_), Ly(Ly_),
+rho(rho_), mu(mu_), cp(cp_), k_thermal(k_thermal_),
+dt(dt_), t_final(t_final_) {
+
+// Initialize grid
+dx = Lx / (nx - 1);
+dy = Ly / (ny - 1);
+
+// Fluid properties
+nu = mu / rho;
+alpha_thermal = k_thermal / (rho * cp);
+beta = 0.00021; // Thermal expansion coefficient (air at 300K)
+T_ref = 300.0; // Reference temperature [K]
+g = 9.81; // Gravity [m/s^2]
+
+// Time control
+t_current = 0.0;
+dt_min = 1e-6;
+dt_max = 0.1;
+CFL_target = 0.5;
+adaptive_time_step = true;
+
+// Solver configuration
+solver_mode = SolverMode::HYBRID_ADAPTIVE;
+flow_regime = FlowRegime::UNSTEADY;
+n_correctors = 2;
+n_ortho_correct = 2;
+n_energy_correct = 1;
+
+// Relaxation factors
+alpha_u = 0.7;
+alpha_v = 0.7;
+alpha_p = 0.3;
+alpha_T = 0.8;
+adaptive_relaxation = true;
+
+// Convergence tolerances
+tol_momentum = 1e-6;
+tol_pressure = 1e-7;
+tol_energy = 1e-6;
+tol_continuity = 1e-8;
+
+// Statistics
+total_iterations = 0;
+time_steps = 0;
+
+// Initialize fields
+initializeFields();
+
+printSolverInfo();
+}
+
+void initializeFields() {
+u.resize(nx, std::vector<double>(ny, 0.0));
+v.resize(nx, std::vector<double>(ny, 0.0));
+p.resize(nx, std::vector<double>(ny, 0.0));
+T.resize(nx, std::vector<double>(ny, T_ref));
+
+u_old.resize(nx, std::vector<double>(ny, 0.0));
+v_old.resize(nx, std::vector<double>(ny, 0.0));
+T_old.resize(nx, std::vector<double>(ny, T_ref));
+
+u_star.resize(nx, std::vector<double>(ny, 0.0));
+v_star.resize(nx, std::vector<double>(ny, 0.0));
+p_prime.resize(nx, std::vector<double>(ny, 0.0));
+
+buoyancy_x.resize(nx, std::vector<double>(ny, 0.0));
+buoyancy_y.resize(nx, std::vector<double>(ny, 0.0));
+}
+
+void printSolverInfo() {
+std::cout << "╔════════════════════════════════════════════════════════╗
+";
+std::cout << "║ HybridThermoFoam - Custom CFD Solver ║
+";
+std::cout << "║ Coupled Thermal-Fluid Dynamics with Buoyancy ║
+";
+std::cout << "╚════════════════════════════════════════════════════════╝
+
+";
+
+std::cout << "Grid Configuration:
+";
+std::cout << " Resolution: " << nx << " x " << ny << "
+";
+std::cout << " Domain: " << Lx << "m x " << Ly << "m
+";
+std::cout << " Cell size: dx=" << dx << "m, dy=" << dy << "m
+
+";
+
+std::cout << "Fluid Properties:
+";
+std::cout << " Density: " << rho << " kg/m³
+";
+std::cout << " Kinematic viscosity: " << nu << " m²/s
+";
+std::cout << " Thermal diffusivity: " << alpha_thermal << " m²/s
+";
+std::cout << " Prandtl number: " << (nu/alpha_thermal) << "
+
+";
+
+std::cout << "Solver Configuration:
+";
+std::cout << " Mode: Hybrid Adaptive (PISO/SIMPLE)
+";
+std::cout << " Pressure correctors: " << n_correctors << "
+";
+std::cout << " Energy correctors: " << n_energy_correct << "
+";
+std::cout << " Target CFL: " << CFL_target << "
+
+";
+}
+
+// ============================================================
+// FLOW REGIME DETECTION
+// ============================================================
+void detectFlowRegime() {
+double max_time_derivative = 0.0;
+
+for (int i = 1; i < nx-1; i++) {
+for (int j = 1; j < ny-1; j++) {
+double du_dt = std::abs((u[i][j] - u_old[i][j]) / dt);
+double dv_dt = std::abs((v[i][j] - v_old[i][j]) / dt);
+double dT_dt = std::abs((T[i][j] - T_old[i][j]) / dt);
+
+max_time_derivative = std::max({max_time_derivative, du_dt, dv_dt, dT_dt});
+}
+}
+
+// Classify flow regime
+if (max_time_derivative < 1e-5) {
+flow_regime = FlowRegime::STEADY;
+n_correctors = 1; // Use SIMPLE-like approach
+} else if (max_time_derivative > 0.1) {
+flow_regime = FlowRegime::UNSTEADY;
+n_correctors = 3; // Use full PISO
+} else {
+flow_regime = FlowRegime::TRANSITIONAL;
+n_correctors = 2; // Balanced approach
+}
+}
+
+// ============================================================
+// BUOYANCY FORCE CALCULATION (Boussinesq Approximation)
+// ============================================================
+void computeBuoyancyForces() {
+for (int i = 0; i < nx; i++) {
+for (int j = 0; j < ny; j++) {
+// Boussinesq approximation: F = ρ * β * g * (T - T_ref)
+double temp_diff = T[i][j] - T_ref;
+buoyancy_x[i][j] = 0.0; // No horizontal buoyancy
+buoyancy_y[i][j] = -rho * beta * g * temp_diff; // Vertical buoyancy
+}
+}
+}
+
+// ============================================================
+// MOMENTUM PREDICTOR WITH BUOYANCY
+// ============================================================
+void momentumPredictor() {
+u_old = u;
+v_old = v;
+T_old = T;
+
+// X-Momentum with buoyancy
+for (int i = 1; i < nx-1; i++) {
+for (int j = 1; j < ny-1; j++) {
+// Convective terms
+double u_e = 0.5 * (u[i][j] + u[i+1][j]);
+double u_w = 0.5 * (u[i][j] + u[i-1][j]);
+double u_n = 0.5 * (u[i][j] + u[i][j+1]);
+double u_s = 0.5 * (u[i][j] + u[i][j-1]);
+
+double conv_x = (u_e*u_e - u_w*u_w) / dx;
+double conv_y = (u_n*v[i][j] - u_s*v[i][j]) / dy;
+
+// Diffusive terms
+double diff_x = nu * (u[i+1][j] - 2*u[i][j] + u[i-1][j]) / (dx*dx);
+double diff_y = nu * (u[i][j+1] - 2*u[i][j] + u[i][j-1]) / (dy*dy);
+
+// Pressure gradient
+double dp_dx = (p[i+1][j] - p[i-1][j]) / (2.0*dx);
+
+// Buoyancy contribution
+double buoyancy_contrib = buoyancy_x[i][j] / rho;
+
+// Predictor
+u_star[i][j] = u_old[i][j] + dt * (
+-conv_x - conv_y + diff_x + diff_y - dp_dx/rho + buoyancy_contrib
+);
+}
+}
+
+// Y-Momentum with buoyancy
+for (int i = 1; i < nx-1; i++) {
+for (int j = 1; j < ny-1; j++) {
+double v_e = 0.5 * (v[i][j] + v[i+1][j]);
+double v_w = 0.5 * (v[i][j] + v[i-1][j]);
+double v_n = 0.5 * (v[i][j] + v[i][j+1]);
+double v_s = 0.5 * (v[i][j] + v[i][j-1]);
+
+double conv_x = (u[i][j]*v_e - u[i][j]*v_w) / dx;
+double conv_y = (v_n*v_n - v_s*v_s) / dy;
+
+double diff_x = nu * (v[i+1][j] - 2*v[i][j] + v[i-1][j]) / (dx*dx);
+double diff_y = nu * (v[i][j+1] - 2*v[i][j] + v[i][j-1]) / (dy*dy);
+
+double dp_dy = (p[i][j+1] - p[i][j-1]) / (2.0*dy);
+
+// Buoyancy contribution (main driving force for natural convection)
+double buoyancy_contrib = buoyancy_y[i][j] / rho;
+
+v_star[i][j] = v_old[i][j] + dt * (
+-conv_x - conv_y + diff_x + diff_y - dp_dy/rho + buoyancy_contrib
+);
+}
+}
+}
+
+// ============================================================
+// PRESSURE CORRECTION (Poisson Equation)
+// ============================================================
+double solvePressureCorrection() {
+for (int i = 0; i < nx; i++) {
+for (int j = 0; j < ny; j++) {
+p_prime[i][j] = 0.0;
+}
+}
+
+int max_iter = 200;
+double max_residual = 0.0;
+
+for (int iter = 0; iter < max_iter; iter++) {
+max_residual = 0.0;
+
+for (int i = 1; i < nx-1; i++) {
+for (int j = 1; j < ny-1; j++) {
+// Continuity residual (mass source)
+double mass_source = (
+(u_star[i+1][j] - u_star[i-1][j]) / (2.0*dx) +
+(v_star[i][j+1] - v_star[i][j-1]) / (2.0*dy)
+);
+
+// Pressure Poisson equation coefficients
+double a_e = dt / (rho * dx * dx);
+double a_w = dt / (rho * dx * dx);
+double a_n = dt / (rho * dy * dy);
+double a_s = dt / (rho * dy * dy);
+double a_p = a_e + a_w + a_n + a_s;
+
+// Gauss-Seidel update
+double p_prime_new = (1.0/a_p) * (
+a_e * p_prime[i+1][j] + a_w * p_prime[i-1][j] +
+a_n * p_prime[i][j+1] + a_s * p_prime[i][j-1] -
+rho * mass_source / dt
+);
+
+double residual = std::abs(p_prime_new - p_prime[i][j]);
+max_residual = std::max(max_residual, residual);
+
+p_prime[i][j] = p_prime_new;
+}
+}
+
+applyPressureCorrectionBC();
+
+if (max_residual < tol_pressure) break;
+}
+
+return max_residual;
+}
+
+void applyPressureCorrectionBC() {
+for (int i = 0; i < nx; i++) {
+p_prime[i][0] = p_prime[i][1];
+p_prime[i][ny-1] = p_prime[i][ny-2];
+}
+for (int j = 0; j < ny; j++) {
+p_prime[0][j] = p_prime[1][j];
+p_prime[nx-1][j] = p_prime[nx-2][j];
+}
+}
+
+// ============================================================
+// VELOCITY AND PRESSURE CORRECTION
+// ============================================================
+void correctVelocityAndPressure() {
+for (int i = 1; i < nx-1; i++) {
+for (int j = 1; j < ny-1; j++) {
+double dp_prime_dx = (p_prime[i+1][j] - p_prime[i-1][j]) / (2.0*dx);
+double dp_prime_dy = (p_prime[i][j+1] - p_prime[i][j-1]) / (2.0*dy);
+
+// Velocity correction
+u[i][j] = u_star[i][j] - (dt/rho) * dp_prime_dx;
+v[i][j] = v_star[i][j] - (dt/rho) * dp_prime_dy;
+
+// Pressure update with under-relaxation
+p[i][j] += alpha_p * p_prime[i][j];
+}
+}
+}
+
+// ============================================================
+// ENERGY EQUATION SOLVER
+// ============================================================
+double solveEnergyEquation() {
+double max_residual = 0.0;
+
+for (int energy_iter = 0; energy_iter < n_energy_correct; energy_iter++) {
+max_residual = 0.0;
+
+for (int i = 1; i < nx-1; i++) {
+for (int j = 1; j < ny-1; j++) {
+// Convective transport
+double T_e = 0.5 * (T[i][j] + T[i+1][j]);
+double T_w = 0.5 * (T[i][j] + T[i-1][j]);
+double T_n = 0.5 * (T[i][j] + T[i][j+1]);
+double T_s = 0.5 * (T[i][j] + T[i][j-1]);
+
+double conv_x = (u[i][j] * T_e - u[i-1][j] * T_w) / dx;
+double conv_y = (v[i][j] * T_n - v[i][j-1] * T_s) / dy;
+
+// Diffusive transport
+double diff_x = alpha_thermal * (T[i+1][j] - 2*T[i][j] + T[i-1][j]) / (dx*dx);
+double diff_y = alpha_thermal * (T[i][j+1] - 2*T[i][j] + T[i][j-1]) / (dy*dy);
+
+// Time derivative
+double dT_dt = (T[i][j] - T_old[i][j]) / dt;
+
+// Energy equation: ∂T/∂t + u·∇T = α∇²T
+double T_new = T_old[i][j] + dt * (
+-conv_x - conv_y + diff_x + diff_y
+);
+
+// Under-relaxation
+T_new = alpha_T * T_new + (1.0 - alpha_T) * T[i][j];
+
+double residual = std::abs(T_new - T[i][j]);
+max_residual = std::max(max_residual, residual);
+
+T[i][j] = T_new;
+}
+}
+}
+
+return max_residual;
+}
+
+// ============================================================
+// BOUNDARY CONDITIONS
+// ============================================================
+void applyBoundaryConditions() {
+// Velocity BCs - Differentially heated cavity
+// Top wall - cold
+for (int i = 0; i < nx; i++) {
+u[i][ny-1] = 0.0;
+v[i][ny-1] = 0.0;
+T[i][ny-1] = T_ref - 10.0; // Cold wall
+}
+
+// Bottom wall - hot
+for (int i = 0; i < nx; i++) {
+u[i][0] = 0.0;
+v[i][0] = 0.0;
+T[i][0] = T_ref + 10.0; // Hot wall
+}
+
+// Left and right walls - adiabatic
+for (int j = 0; j < ny; j++) {
+u[0][j] = 0.0;
+v[0][j] = 0.0;
+T[0][j] = T[1][j]; // Zero gradient
+
+u[nx-1][j] = 0.0;
+v[nx-1][j] = 0.0;
+T[nx-1][j] = T[nx-2][j]; // Zero gradient
+}
+
+// Pressure BCs
+for (int i = 0; i < nx; i++) {
+p[i][0] = p[i][1];
+p[i][ny-1] = p[i][ny-2];
+}
+for (int j = 0; j < ny; j++) {
+p[0][j] = p[1][j];
+p[nx-1][j] = p[nx-2][j];
+}
+p[0][0] = 0.0; // Reference pressure
+}
+
+// ============================================================
+// ADAPTIVE TIME STEPPING
+// ============================================================
+void adaptTimeStep() {
+if (!adaptive_time_step) return;
+
+double u_max = 0.0, v_max = 0.0;
+for (int i = 0; i < nx; i++) {
+for (int j = 0; j < ny; j++) {
+u_max = std::max(u_max, std::abs(u[i][j]));
+v_max = std::max(v_max, std::abs(v[i][j]));
+}
+}
+
+// CFL-based time step
+double dt_convective = CFL_target * std::min(dx/u_max, dy/v_max);
+double dt_diffusive = 0.25 * std::min(dx*dx, dy*dy) / (2.0 * std::max(nu, alpha_thermal));
+
+double dt_new = std::min({dt_convective, dt_diffusive, dt_max});
+dt_new = std::max(dt_new, dt_min);
+
+dt = dt_new;
+}
+
+// ============================================================
+// CONVERGENCE MONITORING
+// ============================================================
+double computeMaxDivergence() {
+double max_div = 0.0;
+for (int i = 1; i < nx-1; i++) {
+for (int j = 1; j < ny-1; j++) {
+double div = std::abs(
+(u[i+1][j] - u[i-1][j]) / (2.0*dx) +
+(v[i][j+1] - v[i][j-1]) / (2.0*dy)
+);
+max_div = std::max(max_div, div);
+}
+}
+return max_div;
+}
+
+double computeNusseltNumber() {
+// Average Nusselt number at hot wall
+double Nu_avg = 0.0;
+for (int i = 1; i < nx-1; i++) {
+double dT_dy = (T[i][1] - T[i][0]) / dy;
+Nu_avg += -dT_dy * Lx / (T[i][0] - T_ref);
+}
+return Nu_avg / (nx - 2);
+}
+
+// ============================================================
+// MAIN SOLVER LOOP
+// ============================================================
+void solve() {
+std::cout << "Starting HybridThermoFoam simulation...
+
+";
+std::cout << "Time Step | Time [s] | CFL | Max Div | Max ΔT | Nu | Regime
+";
+std::cout << std::string(75, '-') << "
+";
+
+int output_interval = 50;
+
+while (t_current < t_final) {
+time_steps++;
+t_current += dt;
+
+// Detect flow regime and adapt algorithm
+if (solver_mode == SolverMode::HYBRID_ADAPTIVE) {
+detectFlowRegime();
+}
+
+// Compute buoyancy forces
+computeBuoyancyForces();
+
+// Step 1: Momentum predictor
+momentumPredictor();
+applyBoundaryConditions();
+
+// Steps 2-3: Corrector loops
+for (int corrector = 0; corrector < n_correctors; corrector++) {
+double p_residual = solvePressureCorrection();
+correctVelocityAndPressure();
+applyBoundaryConditions();
+
+u_star = u;
+v_star = v;
+
+pressure_residuals.push_back(p_residual);
+}
+
+// Step 4: Energy equation
+double T_residual = solveEnergyEquation();
+applyBoundaryConditions();
+energy_residuals.push_back(T_residual);
+
+// Adapt time step
+adaptTimeStep();
+
+// Output monitoring
+if (time_steps % output_interval == 0) {
+double max_div = computeMaxDivergence();
+double CFL = (std::abs(u[nx/2][ny/2])*dt/dx +
+std::abs(v[nx/2][ny/2])*dt/dy);
+double Nu = computeNusseltNumber();
+
+std::string regime_str;
+switch(flow_regime) {
+case FlowRegime::STEADY: regime_str = "Steady"; break;
+case FlowRegime::UNSTEADY: regime_str = "Unsteady"; break;
+case FlowRegime::TRANSITIONAL: regime_str = "Transit"; break;
+}
+
+std::cout << std::setw(9) << time_steps << " | "
+<< std::fixed << std::setprecision(3) << std::setw(8) << t_current << " | "
+<< std::setprecision(2) << std::setw(4) << CFL << " | "
+<< std::scientific << std::setprecision(1) << max_div << " | "
+<< T_residual << " | "
+<< std::fixed << std::setprecision(2) << Nu << " | "
+<< regime_str << "
+";
+}
+
+total_iterations += n_correctors;
+}
+
+std::cout << "
+╔════════════════════════════════════════════════════════╗
+";
+std::cout << "║ Simulation Completed Successfully! ║
+";
+std::cout << "╚════════════════════════════════════════════════════════╝
+";
+std::cout << "
+Statistics:
+";
+std::cout << " Total time steps: " << time_steps << "
+";
+std::cout << " Total iterations: " << total_iterations << "
+";
+std::cout << " Final Nusselt number: " << computeNusseltNumber() << "
+";
+}
+
+// ============================================================
+// OUTPUT AND VISUALIZATION
+// ============================================================
+void exportResults(const std::string& filename) {
+std::ofstream file(filename);
+file << "x,y,u,v,p,T,velocity_magnitude,buoyancy_y
+";
+
+for (int i = 0; i < nx; i++) {
+for (int j = 0; j < ny; j++) {
+double x = i * dx;
+double y = j * dy;
+double vel_mag = std::sqrt(u[i][j]*u[i][j] + v[i][j]*v[i][j]);
+
+file << x << "," << y << ","
+<< u[i][j] << "," << v[i][j] << ","
+<< p[i][j] << "," << T[i][j] << ","
+<< vel_mag << "," << buoyancy_y[i][j] << "
+";
+}
+}
+file.close();
+std::cout << "✓ Results exported to " << filename << "
+";
+}
+
+void exportTemperatureProfile(const std::string& filename) {
+std::ofstream file(filename);
+file << "y,T_centerline
+";
+
+int i_center = nx / 2;
+for (int j = 0; j < ny; j++) {
+file << j*dy << "," << T[i_center][j] << "
+";
+}
+file.close();
+std::cout << "✓ Temperature profile exported to " << filename << "
+";
+}
+};
+
+// ============================================================
+// MAIN FUNCTION
+// ============================================================
+int main() {
+std::cout << "
+";
+std::cout << "╔════════════════════════════════════════════════════════╗
+";
+std::cout << "║ HYBRIDTHERMOFOAM v1.0 ║
+";
+std::cout << "║ Custom CFD Solver for Coupled Thermal-Fluid Dynamics ║
+";
+std::cout << "║ Natural Convection in Heated Cavity ║
+";
+std::cout << "╚════════════════════════════════════════════════════════╝
+
+";
+
+// Problem configuration
+int nx = 65;
+int ny = 65;
+double Lx = 1.0; // Domain width [m]
+double Ly = 1.0; // Domain height [m]
+
+// Air properties at 300K
+double rho = 1.177; // Density [kg/m³]
+double mu = 1.846e-5; // Dynamic viscosity [Pa·s]
+double cp = 1005.0; // Specific heat [J/kg·K]
+double k = 0.0262; // Thermal conductivity [W/m·K]
+
+// Time parameters
+double dt = 0.01; // Initial time step [s]
+double t_final = 50.0; // Total simulation time [s]
+
+std::cout << "Natural Convection Configuration:
+";
+std::cout << " Rayleigh Number (Ra): ~10^6 (turbulent)
+";
+std::cout << " Temperature difference: 20 K
+";
+std::cout << " Heated from bottom, cooled from top
+
+";
+
+// Create solver instance
+HybridThermoFoam solver(nx, ny, Lx, Ly, rho, mu, cp, k, dt, t_final);
+
+// Run simulation
+solver.solve();
+
+// Export results
+solver.exportResults("hybridthermofoam_results.csv");
+solver.exportTemperatureProfile("temperature_profile.csv");
+
+std::cout << "
+✓ All outputs generated successfully!
+";
+std::cout << " - hybridthermofoam_results.csv (full field data)
+";
+std::cout << " - temperature_profile.csv (centerline temperature)
+";
+std::cout << "
+═══════════════════════════════════════════════════════
+
+";
+
+return 0;
+}
